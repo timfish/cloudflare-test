@@ -5,7 +5,16 @@
 import page from "./page.html";
 
 // Objects the page reads. Sizes in bytes.
-const SIZES = { "4k": 4 * 1024, "64k": 64 * 1024, "1m": 1024 * 1024, "8m": 8 * 1024 * 1024 };
+const SIZES = {
+  "4k": 4 * 1024,
+  "64k": 64 * 1024,
+  "256k": 256 * 1024,
+  "1m": 1024 * 1024,
+  "8m": 8 * 1024 * 1024,
+};
+// A fresh set is written for each run, so that cache-miss tests read
+// each object once. The page uses the same layout.
+const FRESH = { small: 500, s64k: 10, s1m: 8, s8m: 4, r256k: 60 };
 // Distinct small objects for the parallel tests.
 const SMALL_COUNT = 250;
 // Kept under the free plan's subrequest limit for one request.
@@ -31,7 +40,7 @@ export default {
             keys: allKeys(),
           });
         case "/seed":
-          return await seed(env, Number(url.searchParams.get("batch") ?? 0));
+          return await seed(env, url.searchParams.get("set") ?? "base", Number(url.searchParams.get("batch") ?? 0));
         case "/presign":
           return await presignAll(env, url.searchParams.getAll("key"));
         default:
@@ -63,21 +72,31 @@ function smallKey(i) {
   return `latency/small-${String(i).padStart(3, "0")}.bin`;
 }
 
+function freshKeys(set) {
+  const keys = [];
+  for (const [name, count] of Object.entries(FRESH)) {
+    for (let i = 0; i < count; i++) keys.push(`latency/${set}/${name}-${String(i).padStart(3, "0")}.bin`);
+  }
+  return keys;
+}
+
 function sizeOf(key) {
-  const named = /size-(\w+)\.bin$/.exec(key);
+  const named = /(?:size-|\/s|\/r)(64k|256k|1m|8m)[-.]/.exec(key);
   return named ? SIZES[named[1]] : SIZES["4k"];
 }
 
 // Writes the test objects, SEED_BATCH per request; the page calls each
 // batch in turn until `done`.
-async function seed(env, batch) {
-  const keys = allKeys();
+async function seed(env, set, batch) {
+  if (set !== "base" && !/^fresh-[a-z0-9]+$/.test(set)) return json({ error: `bad set ${set}` }, 400);
+  const keys = set === "base" ? allKeys() : freshKeys(set);
   const slice = keys.slice(batch * SEED_BATCH, (batch + 1) * SEED_BATCH);
+  // One random block, repeated: cheap on CPU, and not compressible.
+  const block = crypto.getRandomValues(new Uint8Array(65536));
   for (const key of slice) {
     const bytes = new Uint8Array(sizeOf(key));
-    // getRandomValues fills at most 65536 bytes per call.
-    for (let at = 0; at < bytes.length; at += 65536) {
-      crypto.getRandomValues(bytes.subarray(at, Math.min(at + 65536, bytes.length)));
+    for (let at = 0; at < bytes.length; at += block.length) {
+      bytes.set(block.subarray(0, Math.min(block.length, bytes.length - at)), at);
     }
     await env.BUCKET.put(key, bytes);
   }

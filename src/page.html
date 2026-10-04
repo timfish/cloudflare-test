@@ -110,12 +110,21 @@
 
     <script type="module">
       const $ = (id) => document.getElementById(id);
-      let info;
-      let results = [];
-      let meta = {};
-
       const status = (text) => ($("status").textContent = text);
       const now = () => performance.now();
+      const round = (x) => Math.round(x * 10) / 10;
+      let info;
+      let meta = {};
+      let results = [];
+      let unique = 0;
+
+      const smallKey = (i) => `latency/small-${String(i).padStart(3, "0")}.bin`;
+      const sizeKey = (name) => `latency/size-${name}.bin`;
+      const freshName = (name, i) => `${name}-${String(i).padStart(3, "0")}.bin`;
+      // Must match FRESH in src/index.js.
+      const FRESH = { small: 500, s64k: 10, s1m: 8, s8m: 4, r256k: 60 };
+      const MB = 1024 * 1024;
+      const randomOffset = (size, length) => Math.floor(Math.random() * ((size - length) / 4096)) * 4096;
 
       function stats(values) {
         const sorted = [...values].sort((a, b) => a - b);
@@ -123,221 +132,245 @@
         return { n: sorted.length, p50: at(0.5), p90: at(0.9), min: sorted[0], max: sorted[sorted.length - 1] };
       }
 
-      function addRow(path, test, values, extra = "") {
-        const s = stats(values);
-        const round = (x) => Math.round(x * 10) / 10;
-        results.push({ path, test, n: s.n, p50: round(s.p50), p90: round(s.p90), min: round(s.min), max: round(s.max), extra });
-        const tr = document.createElement("tr");
-        for (const cell of [path, test, s.n, round(s.p50), round(s.p90), round(s.min), round(s.max), extra]) {
-          const td = document.createElement("td");
-          td.textContent = cell;
-          tr.append(td);
-        }
-        $("rows").append(tr);
-        $("json").value = JSON.stringify({ meta, results }, null, 2);
-      }
-
-      // One GET. Returns ms to headers, ms to the last byte, and bytes.
+      // One GET. HTTP and network errors come back as ok: false with the
+      // status and the start of the body, so a test can count them.
       async function get(url, range) {
         const headers = range ? { range: `bytes=${range[0]}-${range[0] + range[1] - 1}` } : {};
         const started = now();
-        const response = await fetch(url, { cache: "no-store", headers });
-        const headersAt = now();
-        if (!response.ok) throw new Error(`${response.status} for ${url.split("?")[0]}`);
-        const body = await response.arrayBuffer();
+        try {
+          const response = await fetch(url, { cache: "no-store", headers });
+          const headersAt = now();
+          const cache = response.headers.get("cf-cache-status");
+          if (!response.ok) {
+            const body = (await response.text()).slice(0, 300);
+            return { ok: false, status: response.status, body, cache };
+          }
+          await response.arrayBuffer();
+          return { ok: true, ttfb: headersAt - started, total: now() - started, cache };
+        } catch (e) {
+          return { ok: false, status: 0, body: String(e.message ?? e), cache: null };
+        }
+      }
+
+      function protocolOf(url) {
+        const entry = performance.getEntriesByName(new URL(url, location.href).href).pop();
+        return entry?.nextHopProtocol || "protocol not shown";
+      }
+
+      // What one row of results collects.
+      class Row {
+        constructor(path, test, note = "") {
+          Object.assign(this, { path, test, note, times: [], caches: [], errors: [] });
+        }
+        // Adds the responses of one timed step; `ms` counts only if all were ok.
+        add(ms, responses) {
+          for (const response of responses) {
+            if (response.cache) this.caches.push(response.cache);
+            if (!response.ok) this.errors.push({ status: response.status, body: response.body });
+          }
+          if (responses.every((response) => response.ok)) this.times.push(ms);
+        }
+        done() {
+          const extra = [this.note];
+          if (this.caches.length) {
+            const counts = {};
+            for (const c of this.caches) counts[c] = (counts[c] ?? 0) + 1;
+            extra.push(Object.entries(counts).map(([c, n]) => `${c} ${n}/${this.caches.length}`).join(", "));
+          }
+          if (this.errors.length) {
+            const counts = {};
+            for (const e of this.errors) counts[e.status] = (counts[e.status] ?? 0) + 1;
+            extra.push(`failed: ${Object.entries(counts).map(([c, n]) => `${c === "0" ? "network" : c} ×${n}`).join(", ")}`);
+          }
+          const s = this.times.length ? stats(this.times) : null;
+          const row = {
+            path: this.path,
+            test: this.test,
+            n: s?.n ?? 0,
+            p50: s ? round(s.p50) : null,
+            p90: s ? round(s.p90) : null,
+            min: s ? round(s.min) : null,
+            max: s ? round(s.max) : null,
+            extra: extra.filter(Boolean).join("; "),
+          };
+          if (this.errors.length) {
+            const seen = new Set();
+            row.errors = this.errors.filter((e) => !seen.has(e.status + e.body) && seen.add(e.status + e.body)).slice(0, 3);
+          }
+          results.push(row);
+          const tr = document.createElement("tr");
+          for (const cell of [row.path, row.test, row.n, row.p50, row.p90, row.min, row.max, row.extra]) {
+            const td = document.createElement("td");
+            td.textContent = cell ?? "–";
+            tr.append(td);
+          }
+          $("rows").append(tr);
+          $("json").value = JSON.stringify({ meta, results }, null, 2);
+          return this;
+        }
+      }
+
+      // Times `count` steps of `step`, which returns the responses of one step.
+      async function timed(row, count, step) {
+        for (let i = 0; i < count; i++) {
+          const started = now();
+          const responses = await step(i);
+          row.add(now() - started, responses);
+        }
+        return row.done();
+      }
+
+      // The test set for one path. `keys` names the objects each test reads.
+      async function runTests(name, url, keys, repeats, options = {}) {
+        const r = (n) => Math.max(3, Math.round(n * repeats));
+
+        status(`${name}: first request`);
+        const firstUrl = url(keys.small(0));
+        const first = await get(firstUrl);
+        const firstRow = new Row(name, "first GET on this page, 4 KB (to headers)", `includes connection setup, ${protocolOf(firstUrl)}`);
+        firstRow.add(first.ttfb, [first]);
+        firstRow.done();
+
+        status(`${name}: 4 KB GETs one at a time`);
+        const ttfb = new Row(name, "4 KB GET, to headers");
+        const r2 = new Row(name, "4 KB GET, Worker to R2 only", "Server-Timing");
+        for (let i = 0; i < r(20); i++) {
+          const u = url(keys.small(1 + i));
+          const result = await get(u);
+          ttfb.add(result.ttfb, [result]);
+          if (options.serverTiming && result.ok) {
+            const entry = performance.getEntriesByName(new URL(u, location.href).href).pop();
+            const ms = entry?.serverTiming?.find((t) => t.name === "r2")?.duration;
+            if (ms !== undefined) r2.add(ms, [result]);
+          }
+        }
+        ttfb.done();
+        if (r2.times.length) r2.done();
+
+        for (const [size, bytes, count] of [
+          ["64k", 64 * 1024, 10],
+          ["1m", MB, 8],
+          ["8m", 8 * MB, 4],
+        ]) {
+          status(`${name}: ${size} GETs`);
+          const row = new Row(name, `${size} GET, to last byte`);
+          await timed(row, r(count), async (i) => [await get(url(keys.sized(size, i)))]);
+          if (row.times.length) {
+            const mbps = (bytes / 1e6 / (stats(row.times).p50 / 1000)).toFixed(1);
+            const last = results[results.length - 1];
+            last.extra = [last.extra, `${mbps} MB/s at median`].filter(Boolean).join("; ");
+            $("json").value = JSON.stringify({ meta, results }, null, 2);
+          }
+        }
+
+        status(`${name}: range GETs`);
+        if (keys.warmRange) await get(url(keys.range(0)), [0, 65536]);
+        await timed(new Row(name, `64 KB range of a ${keys.rangeLabel} object`), r(20), async (i) => [
+          await get(url(keys.range(i)), [randomOffset(keys.rangeSize, 65536), 65536]),
+        ]);
+
+        let next = 100;
+        for (const count of keys.parallel) {
+          status(`${name}: ${count} GETs at once`);
+          await timed(new Row(name, `${count} × 4 KB GETs at once, all done`), count === 250 ? 1 : r(3), async () =>
+            Promise.all(Array.from({ length: count }, () => get(url(keys.small(next++))))),
+          );
+        }
+
+        status(`${name}: redraw shape`);
+        let rangeNext = 20;
+        await timed(
+          new Row(name, "redraw: 4 KB GET, then 4 × 64 KB ranges at once", "two round trips"),
+          r(10),
+          async (i) => {
+            const firstHop = await get(url(keys.small(30 + i)));
+            const ranges = await Promise.all(
+              Array.from({ length: 4 }, () => get(url(keys.range(rangeNext++)), [randomOffset(keys.rangeSize, 65536), 65536])),
+            );
+            return [firstHop, ...ranges];
+          },
+        );
+      }
+
+      // The shared objects from Seed. Reads repeat, so a cache could serve them.
+      const sharedKeys = {
+        small: (i) => smallKey(i % 250),
+        sized: (size) => sizeKey(size),
+        range: () => sizeKey("8m"),
+        rangeSize: 8 * MB,
+        rangeLabel: "8 MB",
+        warmRange: true,
+        parallel: [1, 4, 10, 50, 250],
+      };
+
+      // A fresh set: every read is the first read of its object.
+      function freshKeys(set) {
+        const at = (name, i) => `latency/${set}/${freshName(name, i)}`;
         return {
-          ttfb: headersAt - started,
-          total: now() - started,
-          bytes: body.byteLength,
-          cache: response.headers.get("cf-cache-status"),
+          small: (i) => at("small", i),
+          sized: (size, i) => at(`s${size}`, i),
+          range: (i) => at("r256k", i),
+          rangeSize: 256 * 1024,
+          rangeLabel: "256 KB",
+          warmRange: false,
+          parallel: [4, 10, 50],
         };
       }
 
-      // The HTTP version of the last request to `url`, if the browser
-      // exposes it.
-      function protocolOf(url) {
-        const entry = performance.getEntriesByName(new URL(url, location.href).href).pop();
-        return entry?.nextHopProtocol || "not shown";
-      }
-
-      // Server-Timing r2;dur from the Worker, for a URL read once.
-      function workerR2Ms(url) {
-        const entry = performance.getEntriesByName(new URL(url, location.href).href).pop();
-        const r2 = entry?.serverTiming?.find((t) => t.name === "r2");
-        return r2 ? r2.duration : null;
-      }
-
-      let unique = 0;
-      const paths = [];
-
-      function workerPath() {
-        return { name: "worker", url: (key) => `/obj/${key}?u=${unique++}`, serverTiming: true };
-      }
-
-      async function directPath() {
+      async function directUrls(keys) {
         const urls = {};
-        const keys = info.keys;
         for (let i = 0; i < keys.length; i += 50) {
           const query = keys.slice(i, i + 50).map((k) => `key=${encodeURIComponent(k)}`).join("&");
-          const response = await fetch(`/presign?${query}`, { cache: "no-store" });
-          const body = await response.json();
+          const body = await (await fetch(`/presign?${query}`, { cache: "no-store" })).json();
           if (body.error) throw new Error(body.error);
           Object.assign(urls, body.urls);
         }
-        return { name: "direct", url: (key) => urls[key] };
+        return (key) => urls[key];
       }
 
-      // A new query string on each read makes every read a cache miss.
-      function publicPath() {
-        const base = info.publicBase.replace(/\/$/, "");
-        return { name: "public, cache miss", url: (key) => `${base}/${key}?u=${unique++}` };
+      async function seedSet(set) {
+        for (let batch = 0; ; batch++) {
+          status(`Writing objects (${set}), batch ${batch + 1}`);
+          const body = await (await fetch(`/seed?set=${set}&batch=${batch}`, { method: "POST" })).json();
+          if (body.error) throw new Error(body.error);
+          if (body.done) return;
+        }
       }
 
-      // Reads of objects already in Cloudflare's edge cache.
       async function runCached(repeats) {
         const name = "public, cache hit";
         const base = info.publicBase.replace(/\/$/, "");
         const url = (key) => `${base}/${key}`;
         const r = (n) => Math.max(3, Math.round(n * repeats));
-        const hits = (list) => `cf-cache-status HIT ${list.filter((c) => c === "HIT").length}/${list.length}`;
 
         status(`${name}: filling the cache`);
-        const warm = [sizeKey("64k"), sizeKey("1m"), sizeKey("8m")];
+        const warm = [sizeKey("1m"), sizeKey("8m")];
         for (let i = 0; i < 50; i++) warm.push(smallKey(i));
         for (const key of warm) await get(url(key));
         for (const key of warm) await get(url(key));
 
-        status(`${name}: 4 KB GETs one at a time`);
-        const ttfb = [];
-        const caches = [];
+        const ttfb = new Row(name, "4 KB GET, to headers", protocolOf(url(smallKey(0))));
         for (let i = 0; i < r(20); i++) {
           const result = await get(url(smallKey(i % 50)));
-          ttfb.push(result.ttfb);
-          caches.push(result.cache);
+          ttfb.add(result.ttfb, [result]);
         }
-        addRow(name, "4 KB GET, to headers", ttfb, `${hits(caches)}, ${protocolOf(url(smallKey(0)))}`);
-
-        status(`${name}: 1 MB GETs`);
-        const mb = [];
-        const mbCaches = [];
-        for (let i = 0; i < r(8); i++) {
-          const result = await get(url(sizeKey("1m")));
-          mb.push(result.total);
-          mbCaches.push(result.cache);
-        }
-        addRow(name, "1m GET, to last byte", mb, hits(mbCaches));
-
-        status(`${name}: range GETs`);
-        const ranges = [];
-        const rangeCaches = [];
-        for (let i = 0; i < r(20); i++) {
-          const result = await get(url(sizeKey("8m")), [randomOffset(65536), 65536]);
-          ranges.push(result.total);
-          rangeCaches.push(result.cache);
-        }
-        addRow(name, "64 KB range of 8 MB object", ranges, hits(rangeCaches));
-
+        ttfb.done();
+        await timed(new Row(name, "1m GET, to last byte"), r(8), async () => [await get(url(sizeKey("1m")))]);
+        await timed(new Row(name, "64 KB range of an 8 MB object"), r(20), async () => [
+          await get(url(sizeKey("8m")), [randomOffset(8 * MB, 65536), 65536]),
+        ]);
         for (const count of [4, 10, 50]) {
-          status(`${name}: ${count} GETs at once`);
-          const times = [];
-          for (let i = 0; i < r(5); i++) {
-            const started = now();
-            await Promise.all(Array.from({ length: count }, (_, k) => get(url(smallKey(k)))));
-            times.push(now() - started);
-          }
-          addRow(name, `${count} × 4 KB GETs at once, all done`, times);
-        }
-
-        status(`${name}: redraw shape`);
-        const redraw = [];
-        for (let i = 0; i < r(10); i++) {
-          const started = now();
-          await get(url(smallKey(i % 50)));
-          await Promise.all(Array.from({ length: 4 }, () => get(url(sizeKey("8m")), [randomOffset(65536), 65536])));
-          redraw.push(now() - started);
-        }
-        addRow(name, "redraw: 4 KB GET, then 4 × 64 KB ranges at once", redraw, "two round trips");
-      }
-
-      const smallKey = (i) => `latency/small-${String(i).padStart(3, "0")}.bin`;
-      const sizeKey = (name) => `latency/size-${name}.bin`;
-      const EIGHT_MB = 8 * 1024 * 1024;
-      const randomOffset = (length) => Math.floor(Math.random() * ((EIGHT_MB - length) / 4096)) * 4096;
-
-      async function runPath(path, repeats) {
-        const r = (n) => Math.max(3, Math.round(n * repeats));
-        let next = 0;
-        const fresh = () => smallKey(next++ % 250);
-
-        status(`${path.name}: first request`);
-        const firstUrl = path.url(fresh());
-        const first = await get(firstUrl);
-        addRow(
-          path.name,
-          "first GET on this page, 4 KB (to headers)",
-          [first.ttfb],
-          `includes connection setup, ${protocolOf(firstUrl)}`,
-        );
-
-        status(`${path.name}: 4 KB GETs one at a time`);
-        const ttfb = [];
-        const total = [];
-        const r2 = [];
-        for (let i = 0; i < r(20); i++) {
-          const url = path.url(fresh());
-          const result = await get(url);
-          ttfb.push(result.ttfb);
-          total.push(result.total);
-          if (path.serverTiming) {
-            const ms = workerR2Ms(url);
-            if (ms !== null) r2.push(ms);
-          }
-        }
-        addRow(path.name, "4 KB GET, to headers", ttfb);
-        addRow(path.name, "4 KB GET, to last byte", total);
-        if (r2.length) addRow(path.name, "4 KB GET, Worker to R2 only", r2, "Server-Timing");
-
-        for (const [name, bytes, count] of [
-          ["64k", 64 * 1024, 10],
-          ["1m", 1024 * 1024, 8],
-          ["8m", EIGHT_MB, 4],
-        ]) {
-          status(`${path.name}: ${name} GETs`);
-          const times = [];
-          for (let i = 0; i < r(count); i++) times.push((await get(path.url(sizeKey(name)))).total);
-          const mbps = (bytes / 1e6 / (stats(times).p50 / 1000)).toFixed(1);
-          addRow(path.name, `${name} GET, to last byte`, times, `${mbps} MB/s at median`);
-        }
-
-        status(`${path.name}: range GETs`);
-        // The first range GET may need a CORS preflight; leave it out.
-        await get(path.url(sizeKey("8m")), [0, 65536]);
-        const ranges = [];
-        for (let i = 0; i < r(20); i++) ranges.push((await get(path.url(sizeKey("8m")), [randomOffset(65536), 65536])).total);
-        addRow(path.name, "64 KB range of 8 MB object", ranges);
-
-        for (const count of [1, 4, 10, 50, 250]) {
-          status(`${path.name}: ${count} GETs at once`);
-          const times = [];
-          for (let i = 0; i < r(5); i++) {
-            const started = now();
-            await Promise.all(Array.from({ length: count }, () => get(path.url(fresh()))));
-            times.push(now() - started);
-          }
-          addRow(path.name, `${count} × 4 KB GETs at once, all done`, times);
-        }
-
-        status(`${path.name}: redraw shape`);
-        const redraw = [];
-        for (let i = 0; i < r(10); i++) {
-          const started = now();
-          await get(path.url(fresh()));
-          await Promise.all(
-            Array.from({ length: 4 }, () => get(path.url(sizeKey("8m")), [randomOffset(65536), 65536])),
+          await timed(new Row(name, `${count} × 4 KB GETs at once, all done`), r(5), async () =>
+            Promise.all(Array.from({ length: count }, (_, k) => get(url(smallKey(k))))),
           );
-          redraw.push(now() - started);
         }
-        addRow(path.name, "redraw: 4 KB GET, then 4 × 64 KB ranges at once", redraw, "two round trips");
+        await timed(new Row(name, "redraw: 4 KB GET, then 4 × 64 KB ranges at once", "two round trips"), r(10), async (i) => {
+          const firstHop = await get(url(smallKey(i % 50)));
+          const ranges = await Promise.all(
+            Array.from({ length: 4 }, () => get(url(sizeKey("8m")), [randomOffset(8 * MB, 65536), 65536])),
+          );
+          return [firstHop, ...ranges];
+        });
       }
 
       async function run() {
@@ -345,74 +378,59 @@
         results = [];
         $("rows").replaceChildren();
         const repeats = $("quick").checked ? 0.3 : 1;
-        try {
-          meta = {
-            date: new Date().toISOString(),
-            userAgent: navigator.userAgent,
-            connection: navigator.connection
-              ? {
-                  effectiveType: navigator.connection.effectiveType,
-                  rttMs: navigator.connection.rtt,
-                  downlinkMbps: navigator.connection.downlink,
-                }
-              : null,
-            workerColo: info.colo,
-            country: info.country,
-            httpProtocol: info.httpProtocol,
-          };
+        meta = {
+          date: new Date().toISOString(),
+          userAgent: navigator.userAgent,
+          connection: navigator.connection
+            ? { effectiveType: navigator.connection.effectiveType, rttMs: navigator.connection.rtt, downlinkMbps: navigator.connection.downlink }
+            : null,
+          workerColo: info.colo,
+          country: info.country,
+          httpProtocol: info.httpProtocol,
+        };
+        const failed = [];
+        const attempt = async (name, work) => {
+          try {
+            await work();
+          } catch (e) {
+            failed.push(`${name}: ${e.message}`);
+            results.push({ path: name, test: "stopped", error: e.message });
+            $("json").value = JSON.stringify({ meta, results }, null, 2);
+          }
+        };
 
+        await attempt("worker", async () => {
           status("ping: round trip to the Worker, no R2");
-          const pings = [];
-          for (let i = 0; i < 20; i++) {
+          await timed(new Row("worker", "ping, no R2", "browser to Cloudflare edge"), 20, async () => {
             const started = now();
             await (await fetch(`/ping?u=${unique++}`, { cache: "no-store" })).arrayBuffer();
-            pings.push(now() - started);
-          }
-          addRow("worker", "ping, no R2", pings, "browser to Cloudflare edge");
-
-          const hints = {
-            worker: "check the R2 binding and that Seed has run",
-            direct: "check the bucket's CORS rule and the three R2 secrets",
-            "public, cache miss": "check PUBLIC_BASE and the bucket's CORS rule",
-            "public, cache hit": "check PUBLIC_BASE and the bucket's CORS rule",
-          };
-          const failed = [];
-          const makers = [() => workerPath()];
-          if (info.presign) makers.push(directPath);
-          if (info.publicBase) makers.push(() => publicPath());
-          if (info.publicBase) makers.push(() => ({ name: "public, cache hit", run: runCached }));
-          for (const make of makers) {
-            let name = "?";
-            try {
-              const path = await make();
-              name = path.name;
-              if (path.run) await path.run(repeats);
-              else await runPath(path, repeats);
-            } catch (e) {
-              name = name === "?" ? "direct" : name;
-              failed.push(`${name}: ${e.message} (${hints[name]})`);
-              results.push({ path: name, test: "failed", error: e.message });
-              $("json").value = JSON.stringify({ meta, results }, null, 2);
-            }
-          }
-          status(failed.length ? `Done, with failures. ${failed.join("; ")}` : "Done. Copy the JSON below.");
-        } catch (e) {
-          status(`Failed: ${e.message}`);
-        } finally {
-          $("run").disabled = $("seed").disabled = false;
+            return [{ ok: true, total: now() - started }];
+          });
+          await runTests("worker", (key) => `/obj/${key}?u=${unique++}`, sharedKeys, repeats, { serverTiming: true });
+        });
+        if (info.presign) {
+          await attempt("direct", async () => {
+            const url = await directUrls(info.keys);
+            await runTests("direct", url, sharedKeys, repeats);
+          });
         }
+        if (info.publicBase) {
+          const base = info.publicBase.replace(/\/$/, "");
+          await attempt("public, cache miss", async () => {
+            const set = `fresh-${Date.now().toString(36)}`;
+            await seedSet(set);
+            await runTests("public, cache miss", (key) => `${base}/${key}`, freshKeys(set), repeats);
+          });
+          await attempt("public, cache hit", () => runCached(repeats));
+        }
+        status(failed.length ? `Done, but stopped early on: ${failed.join("; ")}` : "Done. Copy the JSON below.");
+        $("run").disabled = $("seed").disabled = false;
       }
 
       async function seed() {
         $("run").disabled = $("seed").disabled = true;
         try {
-          for (let batch = 0; ; batch++) {
-            status(`Seeding, batch ${batch + 1}`);
-            const response = await fetch(`/seed?batch=${batch}`, { method: "POST" });
-            const body = await response.json();
-            if (body.error) throw new Error(body.error);
-            if (body.done) break;
-          }
+          await seedSet("base");
           status("Seeded. Press Run.");
         } catch (e) {
           status(`Seed failed: ${e.message}`);
@@ -429,7 +447,7 @@
       $("info").textContent =
         `Worker at Cloudflare location ${info.colo} (${info.country}), ${info.httpProtocol}. Bucket ${info.bucket}. ` +
         `Paths: worker${info.presign ? ", direct (presigned)" : " (direct path off: R2 secrets not set)"}` +
-        `${info.publicBase ? ", public" : ""}.`;
+        `${info.publicBase ? ", public (cache miss and cache hit)" : ""}.`;
     </script>
   </body>
 </html>
