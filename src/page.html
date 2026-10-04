@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>R2 latency test</title>
+    <style>
+      :root {
+        --bg: #ffffff;
+        --fg: #1a1a1a;
+        --muted: #666;
+        --line: #ddd;
+        --accent: #0b62d6;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #141414;
+          --fg: #ececec;
+          --muted: #999;
+          --line: #333;
+          --accent: #5a9cff;
+        }
+      }
+      body {
+        background: var(--bg);
+        color: var(--fg);
+        font: 15px/1.5 system-ui, sans-serif;
+        margin: 0 auto;
+        max-width: 960px;
+        padding: 16px;
+      }
+      button {
+        background: var(--accent);
+        border: 0;
+        border-radius: 6px;
+        color: #fff;
+        font: inherit;
+        margin: 0 8px 8px 0;
+        padding: 8px 16px;
+      }
+      button:disabled {
+        opacity: 0.5;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      .scroll {
+        overflow-x: auto;
+      }
+      table {
+        border-collapse: collapse;
+        font-variant-numeric: tabular-nums;
+        width: 100%;
+      }
+      th,
+      td {
+        border-bottom: 1px solid var(--line);
+        padding: 4px 8px;
+        text-align: right;
+        white-space: nowrap;
+      }
+      th:first-child,
+      td:first-child,
+      th:nth-child(2),
+      td:nth-child(2) {
+        text-align: left;
+      }
+      textarea {
+        background: var(--bg);
+        border: 1px solid var(--line);
+        box-sizing: border-box;
+        color: var(--fg);
+        font: 12px/1.4 ui-monospace, monospace;
+        height: 200px;
+        width: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>R2 latency test</h1>
+    <p class="muted">
+      Times GETs from this browser to R2. Press Seed once per bucket, then Run. Run again on each device and network
+      you care about, and copy the JSON at the end.
+    </p>
+    <p id="info" class="muted">Loading…</p>
+    <button id="seed">Seed test objects</button>
+    <button id="run">Run</button>
+    <label><input id="quick" type="checkbox" /> Quick run (fewer repeats)</label>
+    <p id="status"></p>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Path</th>
+            <th>Test</th>
+            <th>n</th>
+            <th>Median ms</th>
+            <th>p90 ms</th>
+            <th>Min ms</th>
+            <th>Max ms</th>
+            <th>Extra</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <h2>Results as JSON</h2>
+    <button id="copy">Copy JSON</button>
+    <textarea id="json" readonly></textarea>
+
+    <script type="module">
+      const $ = (id) => document.getElementById(id);
+      let info;
+      let results = [];
+      let meta = {};
+
+      const status = (text) => ($("status").textContent = text);
+      const now = () => performance.now();
+
+      function stats(values) {
+        const sorted = [...values].sort((a, b) => a - b);
+        const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+        return { n: sorted.length, p50: at(0.5), p90: at(0.9), min: sorted[0], max: sorted[sorted.length - 1] };
+      }
+
+      function addRow(path, test, values, extra = "") {
+        const s = stats(values);
+        const round = (x) => Math.round(x * 10) / 10;
+        results.push({ path, test, n: s.n, p50: round(s.p50), p90: round(s.p90), min: round(s.min), max: round(s.max), extra });
+        const tr = document.createElement("tr");
+        for (const cell of [path, test, s.n, round(s.p50), round(s.p90), round(s.min), round(s.max), extra]) {
+          const td = document.createElement("td");
+          td.textContent = cell;
+          tr.append(td);
+        }
+        $("rows").append(tr);
+        $("json").value = JSON.stringify({ meta, results }, null, 2);
+      }
+
+      // One GET. Returns ms to headers, ms to the last byte, and bytes.
+      async function get(url, range) {
+        const headers = range ? { range: `bytes=${range[0]}-${range[0] + range[1] - 1}` } : {};
+        const started = now();
+        const response = await fetch(url, { cache: "no-store", headers });
+        const headersAt = now();
+        if (!response.ok) throw new Error(`${response.status} for ${url.split("?")[0]}`);
+        const body = await response.arrayBuffer();
+        return { ttfb: headersAt - started, total: now() - started, bytes: body.byteLength };
+      }
+
+      // Server-Timing r2;dur from the Worker, for a URL read once.
+      function workerR2Ms(url) {
+        const entry = performance.getEntriesByName(new URL(url, location.href).href).pop();
+        const r2 = entry?.serverTiming?.find((t) => t.name === "r2");
+        return r2 ? r2.duration : null;
+      }
+
+      let unique = 0;
+      const paths = [];
+
+      function workerPath() {
+        return { name: "worker", url: (key) => `/obj/${key}?u=${unique++}`, serverTiming: true };
+      }
+
+      async function directPath() {
+        const urls = {};
+        const keys = info.keys;
+        for (let i = 0; i < keys.length; i += 50) {
+          const query = keys.slice(i, i + 50).map((k) => `key=${encodeURIComponent(k)}`).join("&");
+          const response = await fetch(`/presign?${query}`, { cache: "no-store" });
+          const body = await response.json();
+          if (body.error) throw new Error(body.error);
+          Object.assign(urls, body.urls);
+        }
+        return { name: "direct", url: (key) => urls[key] };
+      }
+
+      function publicPath() {
+        const base = info.publicBase.replace(/\/$/, "");
+        return { name: "public", url: (key) => `${base}/${key}` };
+      }
+
+      const smallKey = (i) => `latency/small-${String(i).padStart(3, "0")}.bin`;
+      const sizeKey = (name) => `latency/size-${name}.bin`;
+      const EIGHT_MB = 8 * 1024 * 1024;
+      const randomOffset = (length) => Math.floor(Math.random() * ((EIGHT_MB - length) / 4096)) * 4096;
+
+      async function runPath(path, repeats) {
+        const r = (n) => Math.max(3, Math.round(n * repeats));
+        let next = 0;
+        const fresh = () => smallKey(next++ % 250);
+
+        status(`${path.name}: first request`);
+        const first = await get(path.url(fresh()));
+        addRow(path.name, "first GET on this page, 4 KB (to headers)", [first.ttfb], "includes connection setup");
+
+        status(`${path.name}: 4 KB GETs one at a time`);
+        const ttfb = [];
+        const total = [];
+        const r2 = [];
+        for (let i = 0; i < r(20); i++) {
+          const url = path.url(fresh());
+          const result = await get(url);
+          ttfb.push(result.ttfb);
+          total.push(result.total);
+          if (path.serverTiming) {
+            const ms = workerR2Ms(url);
+            if (ms !== null) r2.push(ms);
+          }
+        }
+        addRow(path.name, "4 KB GET, to headers", ttfb);
+        addRow(path.name, "4 KB GET, to last byte", total);
+        if (r2.length) addRow(path.name, "4 KB GET, Worker to R2 only", r2, "Server-Timing");
+
+        for (const [name, bytes, count] of [
+          ["64k", 64 * 1024, 10],
+          ["1m", 1024 * 1024, 8],
+          ["8m", EIGHT_MB, 4],
+        ]) {
+          status(`${path.name}: ${name} GETs`);
+          const times = [];
+          for (let i = 0; i < r(count); i++) times.push((await get(path.url(sizeKey(name)))).total);
+          const mbps = (bytes / 1e6 / (stats(times).p50 / 1000)).toFixed(1);
+          addRow(path.name, `${name} GET, to last byte`, times, `${mbps} MB/s at median`);
+        }
+
+        status(`${path.name}: range GETs`);
+        // The first range GET may need a CORS preflight; leave it out.
+        await get(path.url(sizeKey("8m")), [0, 65536]);
+        const ranges = [];
+        for (let i = 0; i < r(20); i++) ranges.push((await get(path.url(sizeKey("8m")), [randomOffset(65536), 65536])).total);
+        addRow(path.name, "64 KB range of 8 MB object", ranges);
+
+        for (const count of [1, 4, 10, 50, 250]) {
+          status(`${path.name}: ${count} GETs at once`);
+          const times = [];
+          for (let i = 0; i < r(5); i++) {
+            const started = now();
+            await Promise.all(Array.from({ length: count }, () => get(path.url(fresh()))));
+            times.push(now() - started);
+          }
+          addRow(path.name, `${count} × 4 KB GETs at once, all done`, times);
+        }
+
+        status(`${path.name}: redraw shape`);
+        const redraw = [];
+        for (let i = 0; i < r(10); i++) {
+          const started = now();
+          await get(path.url(fresh()));
+          await Promise.all(
+            Array.from({ length: 4 }, () => get(path.url(sizeKey("8m")), [randomOffset(65536), 65536])),
+          );
+          redraw.push(now() - started);
+        }
+        addRow(path.name, "redraw: 4 KB GET, then 4 × 64 KB ranges at once", redraw, "two round trips");
+      }
+
+      async function run() {
+        $("run").disabled = $("seed").disabled = true;
+        results = [];
+        $("rows").replaceChildren();
+        const repeats = $("quick").checked ? 0.3 : 1;
+        try {
+          meta = {
+            date: new Date().toISOString(),
+            userAgent: navigator.userAgent,
+            connection: navigator.connection
+              ? {
+                  effectiveType: navigator.connection.effectiveType,
+                  rttMs: navigator.connection.rtt,
+                  downlinkMbps: navigator.connection.downlink,
+                }
+              : null,
+            workerColo: info.colo,
+            country: info.country,
+            httpProtocol: info.httpProtocol,
+          };
+
+          status("ping: round trip to the Worker, no R2");
+          const pings = [];
+          for (let i = 0; i < 20; i++) {
+            const started = now();
+            await (await fetch(`/ping?u=${unique++}`, { cache: "no-store" })).arrayBuffer();
+            pings.push(now() - started);
+          }
+          addRow("worker", "ping, no R2", pings, "browser to Cloudflare edge");
+
+          const hints = {
+            worker: "check the R2 binding and that Seed has run",
+            direct: "check the bucket's CORS rule and the three R2 secrets",
+            public: "check PUBLIC_BASE and that the bucket is public at that address",
+          };
+          const failed = [];
+          const makers = [() => workerPath()];
+          if (info.presign) makers.push(directPath);
+          if (info.publicBase) makers.push(() => publicPath());
+          for (const make of makers) {
+            let name = "?";
+            try {
+              const path = await make();
+              name = path.name;
+              await runPath(path, repeats);
+            } catch (e) {
+              name = name === "?" ? "direct" : name;
+              failed.push(`${name}: ${e.message} (${hints[name]})`);
+              results.push({ path: name, test: "failed", error: e.message });
+              $("json").value = JSON.stringify({ meta, results }, null, 2);
+            }
+          }
+          status(failed.length ? `Done, with failures. ${failed.join("; ")}` : "Done. Copy the JSON below.");
+        } catch (e) {
+          status(`Failed: ${e.message}`);
+        } finally {
+          $("run").disabled = $("seed").disabled = false;
+        }
+      }
+
+      async function seed() {
+        $("run").disabled = $("seed").disabled = true;
+        try {
+          for (let batch = 0; ; batch++) {
+            status(`Seeding, batch ${batch + 1}`);
+            const response = await fetch(`/seed?batch=${batch}`, { method: "POST" });
+            const body = await response.json();
+            if (body.error) throw new Error(body.error);
+            if (body.done) break;
+          }
+          status("Seeded. Press Run.");
+        } catch (e) {
+          status(`Seed failed: ${e.message}`);
+        } finally {
+          $("run").disabled = $("seed").disabled = false;
+        }
+      }
+
+      $("seed").onclick = seed;
+      $("run").onclick = run;
+      $("copy").onclick = () => navigator.clipboard.writeText($("json").value);
+
+      info = await (await fetch("/info", { cache: "no-store" })).json();
+      $("info").textContent =
+        `Worker at Cloudflare location ${info.colo} (${info.country}), ${info.httpProtocol}. Bucket ${info.bucket}. ` +
+        `Paths: worker${info.presign ? ", direct (presigned)" : " (direct path off: R2 secrets not set)"}` +
+        `${info.publicBase ? ", public" : ""}.`;
+    </script>
+  </body>
+</html>

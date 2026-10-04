@@ -1,0 +1,15 @@
+{
+  // Must match the Worker's name in the Cloudflare dashboard, or the
+  // Git build fails.
+  "name": "cloudflare-test",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "observability": { "enabled": true },
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "latency-test" }],
+  "vars": {
+    "BUCKET_NAME": "latency-test",
+    // Optional: a custom domain or r2.dev URL for the bucket, with no
+    // trailing slash, to add a third test path.
+    "PUBLIC_BASE": ""
+  }
+}
