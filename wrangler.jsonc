@@ -5,9 +5,9 @@
   "main": "src/index.js",
   "compatibility_date": "2026-10-01",
   "observability": { "enabled": true },
-  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "latency-test" }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "timmy-testy" }],
   "vars": {
-    "BUCKET_NAME": "latency-test",
+    "BUCKET_NAME": "timmy-testy",
     // Optional: a custom domain or r2.dev URL for the bucket, with no
     // trailing slash, to add a third test path.
     "PUBLIC_BASE": ""
