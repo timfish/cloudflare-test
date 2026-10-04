@@ -10,7 +10,7 @@
     "BUCKET_NAME": "timmy-testy",
     // Optional: a custom domain or r2.dev URL for the bucket, with no
     // trailing slash, to add a third test path.
-    "PUBLIC_BASE": "",
+    "PUBLIC_BASE": "https://latency-test.meaty.io",
     "R2_ACCOUNT_ID": "3a1da48b04e7c1a5b0d9511cdc98f79a"
   }
 }

@@ -145,7 +145,19 @@
         const headersAt = now();
         if (!response.ok) throw new Error(`${response.status} for ${url.split("?")[0]}`);
         const body = await response.arrayBuffer();
-        return { ttfb: headersAt - started, total: now() - started, bytes: body.byteLength };
+        return {
+          ttfb: headersAt - started,
+          total: now() - started,
+          bytes: body.byteLength,
+          cache: response.headers.get("cf-cache-status"),
+        };
+      }
+
+      // The HTTP version of the last request to `url`, if the browser
+      // exposes it.
+      function protocolOf(url) {
+        const entry = performance.getEntriesByName(new URL(url, location.href).href).pop();
+        return entry?.nextHopProtocol || "not shown";
       }
 
       // Server-Timing r2;dur from the Worker, for a URL read once.
@@ -175,9 +187,76 @@
         return { name: "direct", url: (key) => urls[key] };
       }
 
+      // A new query string on each read makes every read a cache miss.
       function publicPath() {
         const base = info.publicBase.replace(/\/$/, "");
-        return { name: "public", url: (key) => `${base}/${key}` };
+        return { name: "public, cache miss", url: (key) => `${base}/${key}?u=${unique++}` };
+      }
+
+      // Reads of objects already in Cloudflare's edge cache.
+      async function runCached(repeats) {
+        const name = "public, cache hit";
+        const base = info.publicBase.replace(/\/$/, "");
+        const url = (key) => `${base}/${key}`;
+        const r = (n) => Math.max(3, Math.round(n * repeats));
+        const hits = (list) => `cf-cache-status HIT ${list.filter((c) => c === "HIT").length}/${list.length}`;
+
+        status(`${name}: filling the cache`);
+        const warm = [sizeKey("64k"), sizeKey("1m"), sizeKey("8m")];
+        for (let i = 0; i < 50; i++) warm.push(smallKey(i));
+        for (const key of warm) await get(url(key));
+        for (const key of warm) await get(url(key));
+
+        status(`${name}: 4 KB GETs one at a time`);
+        const ttfb = [];
+        const caches = [];
+        for (let i = 0; i < r(20); i++) {
+          const result = await get(url(smallKey(i % 50)));
+          ttfb.push(result.ttfb);
+          caches.push(result.cache);
+        }
+        addRow(name, "4 KB GET, to headers", ttfb, `${hits(caches)}, ${protocolOf(url(smallKey(0)))}`);
+
+        status(`${name}: 1 MB GETs`);
+        const mb = [];
+        const mbCaches = [];
+        for (let i = 0; i < r(8); i++) {
+          const result = await get(url(sizeKey("1m")));
+          mb.push(result.total);
+          mbCaches.push(result.cache);
+        }
+        addRow(name, "1m GET, to last byte", mb, hits(mbCaches));
+
+        status(`${name}: range GETs`);
+        const ranges = [];
+        const rangeCaches = [];
+        for (let i = 0; i < r(20); i++) {
+          const result = await get(url(sizeKey("8m")), [randomOffset(65536), 65536]);
+          ranges.push(result.total);
+          rangeCaches.push(result.cache);
+        }
+        addRow(name, "64 KB range of 8 MB object", ranges, hits(rangeCaches));
+
+        for (const count of [4, 10, 50]) {
+          status(`${name}: ${count} GETs at once`);
+          const times = [];
+          for (let i = 0; i < r(5); i++) {
+            const started = now();
+            await Promise.all(Array.from({ length: count }, (_, k) => get(url(smallKey(k)))));
+            times.push(now() - started);
+          }
+          addRow(name, `${count} × 4 KB GETs at once, all done`, times);
+        }
+
+        status(`${name}: redraw shape`);
+        const redraw = [];
+        for (let i = 0; i < r(10); i++) {
+          const started = now();
+          await get(url(smallKey(i % 50)));
+          await Promise.all(Array.from({ length: 4 }, () => get(url(sizeKey("8m")), [randomOffset(65536), 65536])));
+          redraw.push(now() - started);
+        }
+        addRow(name, "redraw: 4 KB GET, then 4 × 64 KB ranges at once", redraw, "two round trips");
       }
 
       const smallKey = (i) => `latency/small-${String(i).padStart(3, "0")}.bin`;
@@ -191,8 +270,14 @@
         const fresh = () => smallKey(next++ % 250);
 
         status(`${path.name}: first request`);
-        const first = await get(path.url(fresh()));
-        addRow(path.name, "first GET on this page, 4 KB (to headers)", [first.ttfb], "includes connection setup");
+        const firstUrl = path.url(fresh());
+        const first = await get(firstUrl);
+        addRow(
+          path.name,
+          "first GET on this page, 4 KB (to headers)",
+          [first.ttfb],
+          `includes connection setup, ${protocolOf(firstUrl)}`,
+        );
 
         status(`${path.name}: 4 KB GETs one at a time`);
         const ttfb = [];
@@ -288,18 +373,21 @@
           const hints = {
             worker: "check the R2 binding and that Seed has run",
             direct: "check the bucket's CORS rule and the three R2 secrets",
-            public: "check PUBLIC_BASE and that the bucket is public at that address",
+            "public, cache miss": "check PUBLIC_BASE and the bucket's CORS rule",
+            "public, cache hit": "check PUBLIC_BASE and the bucket's CORS rule",
           };
           const failed = [];
           const makers = [() => workerPath()];
           if (info.presign) makers.push(directPath);
           if (info.publicBase) makers.push(() => publicPath());
+          if (info.publicBase) makers.push(() => ({ name: "public, cache hit", run: runCached }));
           for (const make of makers) {
             let name = "?";
             try {
               const path = await make();
               name = path.name;
-              await runPath(path, repeats);
+              if (path.run) await path.run(repeats);
+              else await runPath(path, repeats);
             } catch (e) {
               name = name === "?" ? "direct" : name;
               failed.push(`${name}: ${e.message} (${hints[name]})`);

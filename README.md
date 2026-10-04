@@ -22,7 +22,7 @@ A Worker that serves a page to time GETs from a browser to R2. It measures the r
        "AllowedOrigins": ["https://cloudflare-test.<your-subdomain>.workers.dev"],
        "AllowedMethods": ["GET", "HEAD"],
        "AllowedHeaders": ["range"],
-       "ExposeHeaders": ["content-length", "content-range", "etag"],
+       "ExposeHeaders": ["content-length", "content-range", "etag", "cf-cache-status", "age"],
        "MaxAgeSeconds": 3600
      }
    ]
